@@ -127,6 +127,31 @@ describe("a failure escaping through the result graph", () => {
     expect(body).toContain("Internal Server Error");
   });
 
+  // Map and Set fail the plain-object prototype check, but the codec
+  // serializes their entries with full promise support — so both are
+  // channel carriers and must be rebuilt like any plain container.
+  it("is sanitized when a promise inside a Map rejects", async () => {
+    registerServerFunction(
+      "graph-failure-map",
+      async () => new Map([["deferred", Promise.reject(databaseError())]])
+    );
+
+    const body = await wireBody("graph-failure-map");
+    for (const secret of SECRETS) expect(body).not.toContain(secret);
+    expect(body).toContain("Internal Server Error");
+  });
+
+  it("is sanitized when a promise inside a Set rejects", async () => {
+    registerServerFunction(
+      "graph-failure-set",
+      async () => new Set([Promise.reject(databaseError())])
+    );
+
+    const body = await wireBody("graph-failure-set");
+    for (const secret of SECRETS) expect(body).not.toContain(secret);
+    expect(body).toContain("Internal Server Error");
+  });
+
   it("keeps an error the author branded as intentional", async () => {
     registerServerFunction("graph-failure-safe", async function* () {
       yield { page: 1 };
@@ -196,7 +221,9 @@ describe("what the guard must not disturb", () => {
   it("passes a healthy result through untouched, nested promise included", async () => {
     registerServerFunction("graph-healthy", async () => ({
       items: [1, 2],
-      nested: { deferred: Promise.resolve("value") }
+      nested: { deferred: Promise.resolve("value") },
+      lookup: new Map([["key", "entry"]]),
+      tags: new Set(["a", "b"])
     }));
 
     const outcome = await callThrough("graph-healthy");
@@ -204,6 +231,37 @@ describe("what the guard must not disturb", () => {
     const value = (outcome as { value: any }).value;
     expect(value.items).toEqual([1, 2]);
     await expect(value.nested.deferred).resolves.toBe("value");
+    expect(value.lookup).toEqual(new Map([["key", "entry"]]));
+    expect(value.tags).toEqual(new Set(["a", "b"]));
+  });
+
+  // The codec supports cycles as ref nodes; the walk must terminate on the
+  // guarded copy instead of recursing forever (a naive rewalk turns every
+  // cyclic result into a stack overflow that dispatch reports as a 500).
+  it("delivers a cyclic result intact", async () => {
+    registerServerFunction("graph-cyclic", async () => {
+      const node: any = { name: "node" };
+      node.self = node;
+      return node;
+    });
+
+    const outcome = await callThrough("graph-cyclic");
+    expect(outcome.resolved).toBe(true);
+    const value = (outcome as { value: any }).value;
+    expect(value.name).toBe("node");
+    expect(value.self).toBe(value);
+  });
+
+  it("keeps a cycle intact while sanitizing a channel beside it", async () => {
+    registerServerFunction("graph-cyclic-channel", async () => {
+      const node: any = { deferred: Promise.reject(databaseError()) };
+      node.self = node;
+      return node;
+    });
+
+    const body = await wireBody("graph-cyclic-channel");
+    for (const secret of SECRETS) expect(body).not.toContain(secret);
+    expect(body).toContain("Internal Server Error");
   });
 });
 

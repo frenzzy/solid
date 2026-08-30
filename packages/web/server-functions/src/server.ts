@@ -1385,7 +1385,10 @@ function isFormPost(request) {
 // Containers are rebuilt only along paths that actually contain a channel:
 // everything else is passed through by reference, so the common response
 // allocates nothing and reference identity survives for the codec. The
-// WeakMap keeps a repeated reference one object, and terminates cycles.
+// WeakMap keeps a repeated reference one object; each container registers
+// its copy BEFORE walking its children, so a cycle (which the codec
+// supports as a ref node) terminates here and lands on the guarded copy
+// rather than recursing forever or re-admitting the raw original.
 /**
  * Wraps the failure channels in a value so a rejection reaching the codec
  * is sanitized like any other error. Applied to every server-function
@@ -1431,13 +1434,16 @@ export function guardFailures(value, seen) {
     return guardedIterable;
   }
 
+  // In runtimes where ReadableStream is async-iterable (Node included) the
+  // branch above claims it and guards each step value; this branch only
+  // catches a stream that is not, so it guards its chunks the same way.
   if (typeof ReadableStream !== "undefined" && value instanceof ReadableStream) {
     const reader = value.getReader();
     const guardedStream = new ReadableStream({
       async pull(controller) {
         try {
           const { done, value: chunk } = await reader.read();
-          done ? controller.close() : controller.enqueue(chunk);
+          done ? controller.close() : controller.enqueue(guardFailures(chunk, seen));
         } catch (error) {
           controller.error(sanitizeServerError(error));
         }
@@ -1451,15 +1457,49 @@ export function guardFailures(value, seen) {
   }
 
   if (Array.isArray(value)) {
+    const next = [];
+    next.length = value.length;
+    seen.set(value, next);
     let changed = false;
-    const next = value.map(entry => {
+    for (let i = 0; i < value.length; i++) {
+      if (!(i in value)) continue;
+      const guarded = guardFailures(value[i], seen);
+      if (guarded !== value[i]) changed = true;
+      next[i] = guarded;
+    }
+    if (!changed) seen.set(value, value);
+    return changed ? next : value;
+  }
+
+  // The codec serializes Map and Set entries with full promise support, so
+  // both are channel carriers like any plain container. Keyed on the exact
+  // constructor, matching the codec's own dispatch — a subclass falls
+  // through to the passthrough below and the codec refuses it regardless.
+  if (value.constructor === Map) {
+    const next = new Map();
+    seen.set(value, next);
+    let changed = false;
+    for (const [key, entry] of value) {
+      const guardedKey = guardFailures(key, seen);
+      const guardedEntry = guardFailures(entry, seen);
+      if (guardedKey !== key || guardedEntry !== entry) changed = true;
+      next.set(guardedKey, guardedEntry);
+    }
+    if (!changed) seen.set(value, value);
+    return changed ? next : value;
+  }
+
+  if (value.constructor === Set) {
+    const next = new Set();
+    seen.set(value, next);
+    let changed = false;
+    for (const entry of value) {
       const guarded = guardFailures(entry, seen);
       if (guarded !== entry) changed = true;
-      return guarded;
-    });
-    const result = changed ? next : value;
-    seen.set(value, result);
-    return result;
+      next.add(guarded);
+    }
+    if (!changed) seen.set(value, value);
+    return changed ? next : value;
   }
 
   // Plain objects only: a class instance's own properties are not ours to
@@ -1478,6 +1518,10 @@ export function guardFailures(value, seen) {
   // way to avoid. A channel behind an accessor is left unguarded, which is
   // the same bargain as the class instance above: not ours to invoke.
   const descriptors = Object.getOwnPropertyDescriptors(value);
+  // Created empty and populated after the walk, so a cycle edge encountered
+  // mid-walk lands on the copy itself.
+  const next = Object.create(prototype);
+  seen.set(value, next);
   let changed = false;
   for (const key of Object.keys(value)) {
     const descriptor = descriptors[key];
@@ -1487,9 +1531,12 @@ export function guardFailures(value, seen) {
     descriptors[key] = { ...descriptor, value: guarded };
     changed = true;
   }
-  const result = changed ? Object.create(prototype, descriptors) : value;
-  seen.set(value, result);
-  return result;
+  if (!changed) {
+    seen.set(value, value);
+    return value;
+  }
+  Object.defineProperties(next, descriptors);
+  return next;
 }
 
 export function serializeResponseStream(value, codecOptions, signal) {
